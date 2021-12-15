@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{thread, time};
 
@@ -76,7 +76,7 @@ pub enum ClientError {
 
 fn handle_client(
     stream: &TcpStream,
-    numbers_sender: &mpsc::Sender<Number>,
+    numbers_sender: &flume::Sender<Number>,
     shutdown_flag: &ShutdownFlag,
 ) -> Result<(), ClientError> {
     // Use a buffered reader to get lines easily.
@@ -88,11 +88,12 @@ fn handle_client(
         if size == 0 {
             return Err(ClientError::Disconnected);
         } else {
-            // Simple number parsing. 🐢 Bottleneck.
+            // 🐢 Simple number parsing.
             let value = line.trim_end();
             match value.parse::<Number>() {
                 Ok(number) => {
                     // It's ok to panic here if all listeners are dropped.
+                    // 🐢 Channel performance matters.
                     numbers_sender.send(number).unwrap();
                     line.clear();
                     // loop!
@@ -130,10 +131,11 @@ fn main() -> Result<()> {
 
     // These producers-consumer channels will be used to communicate values
     // between threads.
+    // `flume` is a drop-in remplacement for `std::sync::mpsc`, but faster.
     // This one will be used to pass clients values to the dedup thread.
-    let (numbers_sender, numbers_receiver) = mpsc::channel::<Number>();
+    let (numbers_sender, numbers_receiver) = flume::unbounded();
     // This one will be used to pass uniques values to the file writer.
-    let (uniques_sender, uniques_receiver) = mpsc::channel::<Number>();
+    let (uniques_sender, uniques_receiver) = flume::unbounded();
 
     // 🧵 Dedup thread!
     // Pass references of counters to the thread using clones (thanks Arc).
@@ -146,6 +148,7 @@ fn main() -> Result<()> {
         // Exit when `numbers_senders` are dropped.
         while let Ok(number) = numbers_receiver.recv() {
             dedup_total_counter.inc();
+            // 🐢 Check unicity.
             if uniques.insert(number) {
                 dedup_uniques_counter.inc();
                 // Will if consumer is dropped first, panic anyway.
@@ -242,7 +245,7 @@ fn main() -> Result<()> {
                 thread::sleep(time::Duration::from_millis(100));
             }
             Err(e) => {
-                // Something is wrong with acception connections, exit gracefully.
+                // Something is wrong with accepting connections, exit gracefully.
                 error!("IO Error: {}", e);
                 break;
             }
