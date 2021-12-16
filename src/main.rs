@@ -19,6 +19,7 @@ const PORT: u32 = 4000;
 const MAX_CLIENTS: usize = 5;
 const REPORT_PERIOD_SECONDS: u64 = 10;
 const FILENAME: &str = "numbers.log";
+const READ_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
 
 type Number = u64;
 
@@ -80,7 +81,7 @@ fn handle_client(
     shutdown_flag: &ShutdownFlag,
 ) -> Result<(), ClientError> {
     // Use a buffered reader to get lines easily.
-    let mut reader = BufReader::new(stream);
+    let mut reader = BufReader::with_capacity(READ_BUFFER_SIZE, stream);
     let mut line = String::new();
     while !shutdown_flag.is_set() {
         // Warning: This will block on idle clients.
