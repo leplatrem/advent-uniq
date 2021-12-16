@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::ops::{AddAssign, SubAssign};
@@ -6,9 +7,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::{thread, time};
 
-// Use a fast set (non crypto and using AES)
-// https://github.com/tkaitchuck/ahash#readme
-use ahash::AHashSet;
 // Context stack traces.
 use anyhow::{Context, Result};
 // Some logging tools, to avoid println!()
@@ -137,7 +135,7 @@ fn main() -> Result<()> {
     let dedup_uniques_counter = uniques_counter.clone();
     let dedup_thread = thread::spawn(move || {
         // Use a set to dedup values.
-        let mut uniques = AHashSet::new();
+        let mut uniques = HashSet::new();
         // Block until a number is available to read in the channel.
         // Exit when `numbers_senders` are dropped.
         while let Ok(number) = numbers_receiver.recv() {
