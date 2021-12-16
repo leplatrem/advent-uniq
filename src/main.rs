@@ -84,8 +84,9 @@ fn handle_client(
         if size == 0 {
             return Err(ClientError::Disconnected);
         } else {
+            // Slicing the input instead of using `.trim_end()` costs half.
+            let value = &line[0..line.len()-1]; // clients cannot send '\r\n'
             // 🐢 Simple number parsing.
-            let value = line.trim_end();
             match value.parse::<Number>() {
                 Ok(number) => {
                     // It's ok to panic here if all listeners are dropped.
