@@ -1,8 +1,9 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::ops::{AddAssign, SubAssign};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 use std::{thread, time};
 
 // Use a fast set (non crypto and using AES)
@@ -23,50 +24,45 @@ const READ_BUFFER_SIZE: usize = 1024 * 1024; // 1MB
 
 type Number = u64;
 
-/// A safe counter to be shared between threads.
-/// We use Rust atomics because this is more performant
-/// than lock-based solutions, and the complexity tradeoff
-/// is acceptable for a simple counter.
-/// https://doc.rust-lang.org/nomicon/atomics.html
-pub struct AtomicCounter(AtomicUsize);
+/// A simple thread-safe counter abstraction using
+/// a read/write lock.
+/// Using `AtomicUsize` would also be acceptable, but
+/// a `RwLock` on top of a generic feels more natural.
+struct Counter<T>(RwLock<T>);
 
-impl AtomicCounter {
+impl<T> Counter<T>
+where
+    T: Copy + From<u8> + AddAssign + SubAssign,
+{
     fn new() -> Self {
-        AtomicCounter(AtomicUsize::new(0))
+        Counter(RwLock::new(0.into()))
     }
 
-    fn dec(&self) -> usize {
-        self.0.fetch_sub(1, Ordering::SeqCst)
+    fn dec(&self) {
+        *self.0.write().unwrap() -= 1.into()
     }
 
-    fn inc(&self) -> usize {
-        self.0.fetch_add(1, Ordering::SeqCst)
+    fn inc(&self) {
+        *self.0.write().unwrap() += 1.into()
     }
 
-    fn value(&self) -> usize {
-        self.0.load(Ordering::SeqCst)
+    fn value(&self) -> T {
+        *self.0.read().unwrap()
     }
 }
 
-/// A thread safe boolean flag used to detect shutdown.
-pub struct ShutdownFlag(AtomicBool);
-
-impl ShutdownFlag {
-    fn new() -> Self {
-        ShutdownFlag(AtomicBool::new(false))
-    }
-
-    fn set(&self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    fn is_set(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
+/// A global thread-safe mutable to shutdown everything.
+/// This is probably one of the rarest case where a global is
+/// acceptable.
+/// We use a relaxed atomic since this is very cheap and consistency
+/// is not crucial to initiate shutdown accross threads.
+static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+fn is_shutdown() -> bool {
+    SHUTDOWN_FLAG.load(Ordering::Relaxed)
 }
 
 #[derive(Debug, Error)]
-pub enum ClientError {
+enum ClientError {
     #[error("client sent bad data ({0})")]
     BadInput(String),
     #[error("client closed connection")]
@@ -78,13 +74,12 @@ pub enum ClientError {
 fn handle_client(
     stream: &TcpStream,
     numbers_sender: &flume::Sender<Number>,
-    shutdown_flag: &ShutdownFlag,
 ) -> Result<(), ClientError> {
     // Use a buffered reader to get lines easily.
     let mut reader = BufReader::with_capacity(READ_BUFFER_SIZE, stream);
     let mut line = String::new();
-    while !shutdown_flag.is_set() {
-        // Warning: This will block on idle clients.
+    while !is_shutdown() {
+        // Warning ⚠️: This will block on idle/slow clients.
         let size = reader.read_line(&mut line)?;
         if size == 0 {
             return Err(ClientError::Disconnected);
@@ -103,7 +98,7 @@ fn handle_client(
                     // Not a number.
                     if value == "terminate" {
                         // Flag state to `shutdown` and exit.
-                        shutdown_flag.set();
+                        SHUTDOWN_FLAG.store(true, Ordering::Relaxed);
                         return Ok(());
                     }
                     return Err(ClientError::BadInput(value.into()));
@@ -123,12 +118,9 @@ fn main() -> Result<()> {
         .context("Failed to set non-blocking TcpListener")?;
 
     // Some counters for reporting metrics.
-    let peers_counter = Arc::new(AtomicCounter::new());
-    let total_counter = Arc::new(AtomicCounter::new());
-    let uniques_counter = Arc::new(AtomicCounter::new());
-
-    // A global flag for shutdown.
-    let shutdown_flag = Arc::new(ShutdownFlag::new());
+    let total_counter = Arc::new(Counter::new());
+    let uniques_counter = Arc::new(Counter::new());
+    let peers_counter = Arc::new(Counter::<usize>::new());
 
     // These producers-consumer channels will be used to communicate values
     // between threads.
@@ -159,8 +151,8 @@ fn main() -> Result<()> {
     });
 
     // 🧵 File write thread!
-    let mut output = File::create(FILENAME)
-        .with_context(|| format!("Failed to create file {}", FILENAME))?;
+    let mut output =
+        File::create(FILENAME).with_context(|| format!("Failed to create file {}", FILENAME))?;
     let filewrite_thread = thread::spawn(move || {
         while let Ok(number) = uniques_receiver.recv() {
             output
@@ -168,8 +160,8 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Cannot write to file {}", FILENAME))
                 // Panic if cannot write to file.
                 .unwrap();
-            }
-        });
+        }
+    });
 
     // 🧵 Reporter thread!
     // This thread will read the counters and report regularly.
@@ -222,9 +214,8 @@ fn main() -> Result<()> {
                 peers_counter.inc();
                 let numbers_sender_n = numbers_sender.clone();
                 let peers_counter_n = peers_counter.clone();
-                let shutdown_flag_n = shutdown_flag.clone();
                 let th = thread::spawn(move || {
-                    if let Err(e) = handle_client(&stream, &numbers_sender_n, &shutdown_flag_n) {
+                    if let Err(e) = handle_client(&stream, &numbers_sender_n) {
                         debug!("Error from {}: {}", remote, e);
                     }
                     peers_counter_n.dec();
@@ -238,7 +229,7 @@ fn main() -> Result<()> {
             // No connection available yet.
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Exit if the `shutdown` flag is set
-                if shutdown_flag.is_set() {
+                if is_shutdown() {
                     info!("Graceful shutdown!");
                     break;
                 }
